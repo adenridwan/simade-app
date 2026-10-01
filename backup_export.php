@@ -66,9 +66,13 @@ function sql_value(PDO $pdo, $value): string
 
 function table_exists(PDO $pdo, string $tableName): bool
 {
-    $stmt = $pdo->prepare('SHOW TABLES LIKE :t');
+    // SHOW TABLES tidak menerima placeholder pada native prepared statement (EMULATE_PREPARES = false).
+    $stmt = $pdo->prepare(
+        'SELECT COUNT(*) FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t'
+    );
     $stmt->execute([':t' => $tableName]);
-    return (bool)$stmt->fetchColumn();
+    return (int)$stmt->fetchColumn() > 0;
 }
 
 function export_table_sql(PDO $pdo, string $tableName): string

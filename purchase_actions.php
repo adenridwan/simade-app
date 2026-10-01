@@ -505,6 +505,13 @@ try {
             }
         }
 
+        // Lepas tag di transaksi penjualan supaya nota lama tidak ikut hilang, cuma jadi tanpa pembelian.
+        $hasSalesPurchaseTag = $pdo->query("SHOW COLUMNS FROM sales_transactions LIKE 'purchase_id'")->fetch(PDO::FETCH_ASSOC);
+        if ($hasSalesPurchaseTag) {
+            $untag = $pdo->prepare('UPDATE sales_transactions SET purchase_id = NULL WHERE purchase_id = :id');
+            $untag->execute([':id' => $purchaseId]);
+        }
+
         // delete purchase (items and payments will cascade)
         $del = $pdo->prepare('DELETE FROM purchase_orders WHERE id = :id');
         $del->execute([':id' => $purchaseId]);

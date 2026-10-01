@@ -149,6 +149,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'save_print_templates') {
     $notaTemplate = trim((string)($_POST['template_nota_html'] ?? ''));
     $kwitansiTemplate = trim((string)($_POST['template_kwitansi_html'] ?? ''));
+    $laporanTemplate = trim((string)($_POST['template_laporan_html'] ?? ''));
 
     $stmt = $pdo->prepare(
         'INSERT INTO print_templates (template_type, template_name, format_type, template_content, is_active)
@@ -168,6 +169,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         ':type' => 'kwitansi',
         ':name' => 'Template Kwitansi',
         ':content' => $kwitansiTemplate,
+    ]);
+    $stmt->execute([
+        ':type' => 'laporan_transaksi',
+        ':name' => 'Template Daftar Transaksi',
+        ':content' => $laporanTemplate,
     ]);
 
     header('Location: settings.php?msg=template_saved');
@@ -384,19 +390,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)($_POST['action'] ?? '') ==
     }
 
     try {
-        // lakukan import dalam transaksi; matikan foreign key checks sementara untuk mengurangi error dependensi
-        $pdo->beginTransaction();
+        // Jangan bungkus dump dalam transaksi PDO. File dump mengatur transaksinya
+        // sendiri (ekspor dari aplikasi mobile menulis START TRANSACTION/COMMIT),
+        // dan MySQL melakukan implicit commit pada setiap DDL. Akibatnya saat
+        // $pdo->commit() dipanggil sudah tidak ada transaksi aktif, dan impor yang
+        // sebenarnya berhasil tetap dilaporkan gagal dengan pesan
+        // "There is no active transaction".
         $pdo->exec('SET FOREIGN_KEY_CHECKS=0;');
         // menjalankan seluruh isi file SQL; jika DB besar atau file kompleks, eksekusi bisa gagal => tangani exception
         $pdo->exec($sql);
         $pdo->exec('SET FOREIGN_KEY_CHECKS=1;');
-        $pdo->commit();
+
+        // Dump boleh saja meninggalkan transaksi terbuka (mis. ada START
+        // TRANSACTION tanpa COMMIT di akhir file).
+        if ($pdo->inTransaction()) {
+            $pdo->commit();
+        }
 
         header('Location: settings.php?msg=import_success');
         exit;
     } catch (Exception $e) {
-        // rollback dan kirim pesan error (di-URL encode)
-        try { $pdo->rollBack(); } catch (Exception $_) {}
+        if ($pdo->inTransaction()) {
+            try { $pdo->rollBack(); } catch (Exception $_) {}
+        }
+        // FOREIGN_KEY_CHECKS bersifat per-sesi; jangan biarkan mati karena impor gagal
+        try { $pdo->exec('SET FOREIGN_KEY_CHECKS=1;'); } catch (Exception $_) {}
         $err = $e->getMessage();
         header('Location: settings.php?msg=import_error&error=' . urlencode($err));
         exit;
@@ -416,6 +434,7 @@ $templateRows = $pdo->query('SELECT template_type, template_content FROM print_t
 $printTemplates = [
     'nota' => '',
     'kwitansi' => '',
+    'laporan_transaksi' => '',
 ];
 foreach ($templateRows as $templateRow) {
     $type = (string)$templateRow['template_type'];
@@ -466,6 +485,51 @@ $defaultKwitansiTemplate = <<<HTML
 </div>
 HTML;
 
+$defaultLaporanTemplate = <<<HTML
+<div style="font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#111;padding:12px;">
+  <div style="text-align:center;margin-bottom:10px;">
+    <div style="font-size:16px;font-weight:bold;">{{store_name}}</div>
+    <div>{{store_address}}</div>
+    <div>{{store_phone}}</div>
+  </div>
+  <div style="text-align:center;font-weight:bold;font-size:14px;margin-bottom:4px;">{{report_title}}</div>
+  <div style="text-align:center;margin-bottom:10px;">Periode: {{period}} &bull; Status: {{filter_status}}</div>
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr>
+        <th style="border:1px solid #999;padding:5px;text-align:center;">No</th>
+        <th style="border:1px solid #999;padding:5px;text-align:left;">Invoice</th>
+        <th style="border:1px solid #999;padding:5px;text-align:left;">Pelanggan</th>
+        <th style="border:1px solid #999;padding:5px;text-align:left;">Waktu</th>
+        <th style="border:1px solid #999;padding:5px;text-align:right;">Total</th>
+        <th style="border:1px solid #999;padding:5px;text-align:right;">Diskon</th>
+        <th style="border:1px solid #999;padding:5px;text-align:right;">Uang Muka</th>
+        <th style="border:1px solid #999;padding:5px;text-align:right;">Sisa Bayar</th>
+        <th style="border:1px solid #999;padding:5px;text-align:left;">Metode</th>
+        <th style="border:1px solid #999;padding:5px;text-align:left;">Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{rows}}
+    </tbody>
+    <tfoot>
+      <tr style="font-weight:bold;background:#f1f5f9;">
+        <td style="border:1px solid #999;padding:5px;" colspan="4">Total {{total_transaksi}} transaksi</td>
+        <td style="border:1px solid #999;padding:5px;text-align:right;">{{grand_total}}</td>
+        <td style="border:1px solid #999;padding:5px;text-align:right;">{{grand_discount}}</td>
+        <td style="border:1px solid #999;padding:5px;text-align:right;">{{grand_downpayment}}</td>
+        <td style="border:1px solid #999;padding:5px;text-align:right;">{{grand_sisa}}</td>
+        <td style="border:1px solid #999;padding:5px;" colspan="2"></td>
+      </tr>
+    </tfoot>
+  </table>
+  <div style="margin-top:10px;display:flex;justify-content:space-between;">
+    <span>{{footer_text}}</span>
+    <span>Dicetak: {{print_date}}</span>
+  </div>
+</div>
+HTML;
+
 try {
     if (trim($printTemplates['nota']) === '') {
         $stmt = $pdo->prepare(
@@ -492,6 +556,19 @@ try {
         );
         $stmt->execute([':type' => 'kwitansi', ':name' => 'Template Kwitansi', ':content' => $defaultKwitansiTemplate]);
         $printTemplates['kwitansi'] = $defaultKwitansiTemplate;
+    }
+    if (trim($printTemplates['laporan_transaksi']) === '') {
+        $stmt = $pdo->prepare(
+            'INSERT INTO print_templates (template_type, template_name, format_type, template_content, is_active)
+             VALUES (:type, :name, "html", :content, 1)
+             ON DUPLICATE KEY UPDATE
+                template_name = VALUES(template_name),
+                template_content = VALUES(template_content),
+                is_active = VALUES(is_active),
+                updated_at = CURRENT_TIMESTAMP'
+        );
+        $stmt->execute([':type' => 'laporan_transaksi', ':name' => 'Template Daftar Transaksi', ':content' => $defaultLaporanTemplate]);
+        $printTemplates['laporan_transaksi'] = $defaultLaporanTemplate;
     }
 } catch (Throwable $e) {
     // If DB insert fails, silently continue and show whatever existing templates are present.
@@ -1355,6 +1432,10 @@ $suppliers = $pdo->query('SELECT id, supplier_code, supplier_name, contact_name,
                                 <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px;">Template Kwitansi (HTML)</label>
                                 <textarea name="template_kwitansi_html" placeholder="<div>Template Kwitansi...</div>"><?= htmlspecialchars($printTemplates['kwitansi']) ?></textarea>
                             </div>
+                            <div class="template-box" style="grid-column:1 / -1;">
+                                <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px;">Template Daftar Transaksi (HTML)</label>
+                                <textarea name="template_laporan_html" placeholder="<div>Template Daftar Transaksi...</div>"><?= htmlspecialchars($printTemplates['laporan_transaksi']) ?></textarea>
+                            </div>
                         </div>
                         <div class="template-hint">
                             Placeholder yang tersedia:
@@ -1377,6 +1458,22 @@ $suppliers = $pdo->query('SELECT id, supplier_code, supplier_name, contact_name,
                             <code>{{status}}</code>
                             <code>{{footer_text}}</code>
                             <div class="muted-note" style="margin-top:8px;">Catatan: <strong>{{total}}</strong> menunjukkan nilai subtotal (sebelum dikurangi diskon dan uang muka). Gunakan <strong>{{sisa_bayar}}</strong> untuk menampilkan sisa yang harus dibayar (subtotal - diskon - uang muka).</div>
+                            <div style="margin-top:10px;">
+                                Khusus <strong>Template Daftar Transaksi</strong>:
+                                <code>{{report_title}}</code>
+                                <code>{{period}}</code>
+                                <code>{{filter_status}}</code>
+                                <code>{{filter_search}}</code>
+                                <code>{{print_date}}</code>
+                                <code>{{rows}}</code>
+                                <code>{{total_transaksi}}</code>
+                                <code>{{grand_total}}</code>
+                                <code>{{grand_discount}}</code>
+                                <code>{{grand_downpayment}}</code>
+                                <code>{{grand_sisa}}</code>
+                                <code>{{grand_paid}}</code>
+                                <div class="muted-note" style="margin-top:8px;"><strong>{{rows}}</strong> diisi otomatis dengan baris <code>&lt;tr&gt;</code> berisi 10 kolom: No, Invoice, Pelanggan, Waktu, Total, Diskon, Uang Muka, Sisa Bayar, Metode, Status. Placeholder toko (<code>{{store_name}}</code>, <code>{{logo_img}}</code>, dll) dan <code>{{footer_text}}</code> juga tersedia di template ini.</div>
+                            </div>
                         </div>
                         <div class="panel-footer" style="margin-top:10px;">
                             <button type="submit" class="btn-primary">
