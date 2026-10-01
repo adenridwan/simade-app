@@ -53,6 +53,21 @@ $hasIsNonCash = $pdo->query("SHOW COLUMNS FROM sales_transactions LIKE 'is_non_c
 if (!$hasIsNonCash) {
     $pdo->exec("ALTER TABLE sales_transactions ADD COLUMN is_non_cash TINYINT(1) NOT NULL DEFAULT 0 AFTER payment_note");
 }
+// Label transaksi (dibuat/dikelola dari menu Transaksi) supaya bisa dipakai di laporan.
+$pdo->exec(
+    'CREATE TABLE IF NOT EXISTS transaction_groups (
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        group_name VARCHAR(120) NOT NULL UNIQUE,
+        group_note VARCHAR(255) NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+);
+$hasGroupId = $pdo->query("SHOW COLUMNS FROM sales_transactions LIKE 'group_id'")->fetch(PDO::FETCH_ASSOC);
+if (!$hasGroupId) {
+    $pdo->exec("ALTER TABLE sales_transactions ADD COLUMN group_id INT UNSIGNED NULL AFTER invoice_no");
+    $pdo->exec("ALTER TABLE sales_transactions ADD KEY idx_sales_group_id (group_id)");
+}
 $pdo->exec(
     'CREATE TABLE IF NOT EXISTS sales_transaction_items (
         id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -109,7 +124,7 @@ function payment_filter_label(string $value): string
     return 'Semua';
 }
 
-function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string $status, string $paymentFilter): array
+function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string $status, string $paymentFilter, string $groupFilter = ''): array
 {
     $rangeWhere = 'st.transaction_at >= :start_dt AND st.transaction_at < :end_dt';
     $baseQtyExpr = 'COALESCE(NULLIF(sti.base_qty_total,0), (sti.qty * COALESCE(NULLIF(sti.unit_base_qty_snapshot,0),1)))';
@@ -124,6 +139,16 @@ function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string 
         $statusWhere = ' AND st.status = :status';
         $statusParams[':status'] = $status;
     }
+    // Filter label: '' = semua, 'none' = belum berlabel, angka = label tertentu.
+    $groupWhere = '';
+    $groupParams = [];
+    if ($groupFilter === 'none') {
+        $groupWhere = ' AND st.group_id IS NULL';
+    } elseif ($groupFilter !== '' && ctype_digit($groupFilter)) {
+        $groupWhere = ' AND st.group_id = :group_id';
+        $groupParams[':group_id'] = (int)$groupFilter;
+    }
+
     $paymentWhere = '';
     $paymentParams = [];
     if ($paymentFilter === 'cash') {
@@ -141,9 +166,9 @@ function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string 
             SUM(CASE WHEN st.status = 'paid' THEN st.total ELSE 0 END) AS omzet_paid,
             SUM(CASE WHEN st.status = 'pending' THEN st.total ELSE 0 END) AS omzet_pending
          FROM sales_transactions st
-         WHERE {$rangeWhere} {$statusWhere} {$paymentWhere}"
+         WHERE {$rangeWhere} {$statusWhere} {$paymentWhere} {$groupWhere}"
     );
-    $summaryStmt->execute($baseParams + $statusParams + $paymentParams);
+    $summaryStmt->execute($baseParams + $statusParams + $paymentParams + $groupParams);
     $summary = $summaryStmt->fetch(PDO::FETCH_ASSOC) ?: [];
 
     $baseQtyWhere = $rangeWhere;
@@ -158,6 +183,12 @@ function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string 
     } elseif ($paymentFilter === 'non_cash') {
         $baseQtyWhere .= " AND COALESCE(st.payment_method, CASE WHEN COALESCE(st.is_non_cash, 0) = 1 THEN 'transfer' ELSE 'transfer' END) = :payment_method_base";
         $baseQtyParams[':payment_method_base'] = 'transfer';
+    }
+    if ($groupFilter === 'none') {
+        $baseQtyWhere .= ' AND st.group_id IS NULL';
+    } elseif ($groupFilter !== '' && ctype_digit($groupFilter)) {
+        $baseQtyWhere .= ' AND st.group_id = :group_id_base';
+        $baseQtyParams[':group_id_base'] = (int)$groupFilter;
     }
     $baseQtyStmt = $pdo->prepare(
         "SELECT COALESCE(SUM({$baseQtyExpr}), 0) AS total_base_qty
@@ -176,9 +207,9 @@ function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string 
          FROM sales_transaction_items sti
          INNER JOIN sales_transactions st ON st.id = sti.transaction_id
          LEFT JOIN products p ON p.id = sti.product_id
-         WHERE {$rangeWhere} AND st.status = 'paid' {$paymentWhere}"
+         WHERE {$rangeWhere} AND st.status = 'paid' {$paymentWhere} {$groupWhere}"
     );
-    $labaSummaryStmt->execute($baseParams + $paymentParams);
+    $labaSummaryStmt->execute($baseParams + $paymentParams + $groupParams);
     $labaSummary = $labaSummaryStmt->fetch(PDO::FETCH_ASSOC) ?: [];
 
     $detailStmt = $pdo->prepare(
@@ -189,6 +220,7 @@ function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string 
             st.status,
             COALESCE(st.payment_method, CASE WHEN COALESCE(st.is_non_cash, 0) = 1 THEN 'transfer' ELSE 'transfer' END) AS payment_method,
             COALESCE(st.customer_name, 'Pelanggan Umum') AS customer_name,
+            COALESCE(tg.group_name, '-') AS group_name,
             sti.product_code,
             sti.product_name,
             COALESCE(sti.variant_name, '-') AS variant_name,
@@ -204,10 +236,11 @@ function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string 
          FROM sales_transaction_items sti
          INNER JOIN sales_transactions st ON st.id = sti.transaction_id
          LEFT JOIN products p ON p.id = sti.product_id
-         WHERE {$rangeWhere} {$statusWhere} {$paymentWhere}
+         LEFT JOIN transaction_groups tg ON tg.id = st.group_id
+         WHERE {$rangeWhere} {$statusWhere} {$paymentWhere} {$groupWhere}
          ORDER BY st.transaction_at DESC, st.id DESC, sti.id ASC"
     );
-    $detailStmt->execute($baseParams + $statusParams + $paymentParams);
+    $detailStmt->execute($baseParams + $statusParams + $paymentParams + $groupParams);
     $detailRows = $detailStmt->fetchAll(PDO::FETCH_ASSOC);
 
     $rekapStmt = $pdo->prepare(
@@ -218,12 +251,31 @@ function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string 
             SUM(CASE WHEN st.status = 'paid' THEN st.total ELSE 0 END) AS omzet_paid,
             SUM(CASE WHEN st.status = 'pending' THEN st.total ELSE 0 END) AS omzet_pending
          FROM sales_transactions st
-         WHERE {$rangeWhere} {$paymentWhere}
+         WHERE {$rangeWhere} {$paymentWhere} {$groupWhere}
          GROUP BY DATE(st.transaction_at)
          ORDER BY tx_date DESC"
     );
-    $rekapStmt->execute($baseParams + $paymentParams);
+    $rekapStmt->execute($baseParams + $paymentParams + $groupParams);
     $rekapRows = $rekapStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Rekap per label: inti dari permintaan "nama grup sampai ke laporan".
+    $labelStmt = $pdo->prepare(
+        "SELECT
+            st.group_id,
+            COALESCE(tg.group_name, '(Tanpa Label)') AS group_name,
+            COALESCE(tg.group_note, '') AS group_note,
+            COUNT(*) AS trx_count,
+            SUM(st.total) AS omzet_total,
+            SUM(CASE WHEN st.status = 'paid' THEN st.total ELSE 0 END) AS omzet_paid,
+            SUM(CASE WHEN st.status = 'pending' THEN st.total ELSE 0 END) AS omzet_pending
+         FROM sales_transactions st
+         LEFT JOIN transaction_groups tg ON tg.id = st.group_id
+         WHERE {$rangeWhere} {$paymentWhere} {$groupWhere}
+         GROUP BY st.group_id, tg.group_name, tg.group_note
+         ORDER BY (st.group_id IS NULL) ASC, tg.group_name ASC"
+    );
+    $labelStmt->execute($baseParams + $paymentParams + $groupParams);
+    $labelRows = $labelStmt->fetchAll(PDO::FETCH_ASSOC);
 
     $labaStmt = $pdo->prepare(
         "SELECT
@@ -240,11 +292,11 @@ function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string 
          FROM sales_transaction_items sti
          INNER JOIN sales_transactions st ON st.id = sti.transaction_id
          LEFT JOIN products p ON p.id = sti.product_id
-         WHERE {$rangeWhere}  AND st.status = 'paid' {$paymentWhere}
+         WHERE {$rangeWhere}  AND st.status = 'paid' {$paymentWhere} {$groupWhere}
          GROUP BY sti.product_name, COALESCE(sti.variant_name, '-'), COALESCE(p.harga_beli, 0)
          ORDER BY laba_total DESC, omzet_total DESC"
     );
-    $labaStmt->execute($baseParams + $paymentParams);
+    $labaStmt->execute($baseParams + $paymentParams + $groupParams);
     $labaRows = $labaStmt->fetchAll(PDO::FETCH_ASSOC);
 
     return [
@@ -252,6 +304,7 @@ function fetch_report_data(PDO $pdo, string $startDate, string $endDate, string 
         'laba_summary' => $labaSummary,
         'detail_rows' => $detailRows,
         'rekap_rows' => $rekapRows,
+        'label_rows' => $labelRows,
         'laba_rows' => $labaRows,
     ];
 }
@@ -305,26 +358,36 @@ function sync_missing_unit_snapshots(PDO $pdo, string $startDate, string $endDat
     return (int)$stmt->rowCount();
 }
 
-function output_csv_export(array $data, string $startDate, string $endDate, string $status, string $paymentFilter): void
+/**
+ * PHP 8.4 mendeprecate fputcsv() tanpa parameter $escape, dan pesan Deprecated
+ * ikut tercetak ke badan file CSV sehingga hasil unduhan rusak.
+ * Semua penulisan baris CSV lewat sini supaya parameternya eksplisit.
+ */
+function csv_row($handle, array $fields): void
+{
+    fputcsv($handle, $fields, ',', '"', '\\');
+}
+
+function output_csv_export(array $data, string $startDate, string $endDate, string $status, string $paymentFilter, string $groupLabel = 'Semua'): void
 {
     $filename = "laporan_transaksi_{$startDate}_{$endDate}.csv";
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $filename . '"');
 
     $out = fopen('php://output', 'w');
-    fputcsv($out, ['Laporan Transaksi', $startDate . ' s/d ' . $endDate, 'Status', strtoupper($status), 'Cara Bayar', payment_filter_label($paymentFilter)]);
-    fputcsv($out, []);
-    fputcsv($out, ['RINGKASAN']);
-    fputcsv($out, ['Jumlah Transaksi', (string)($data['summary']['total_trx'] ?? 0)]);
-    fputcsv($out, ['Omzet Total', (string)($data['summary']['omzet_total'] ?? 0)]);
-    fputcsv($out, ['Omzet Paid', (string)($data['summary']['omzet_paid'] ?? 0)]);
-    fputcsv($out, ['Omzet Pending', (string)($data['summary']['omzet_pending'] ?? 0)]);
-    fputcsv($out, ['Total Base Qty', (string)round((float)($data['summary']['total_base_qty'] ?? 0), 2)]);
-    fputcsv($out, ['Laba Kotor', (string)($data['laba_summary']['laba_kotor'] ?? 0)]);
-    fputcsv($out, []);
+    csv_row($out, ['Laporan Transaksi', $startDate . ' s/d ' . $endDate, 'Status', strtoupper($status), 'Cara Bayar', payment_filter_label($paymentFilter), 'Label', $groupLabel]);
+    csv_row($out, []);
+    csv_row($out, ['RINGKASAN']);
+    csv_row($out, ['Jumlah Transaksi', (string)($data['summary']['total_trx'] ?? 0)]);
+    csv_row($out, ['Omzet Total', (string)($data['summary']['omzet_total'] ?? 0)]);
+    csv_row($out, ['Omzet Paid', (string)($data['summary']['omzet_paid'] ?? 0)]);
+    csv_row($out, ['Omzet Pending', (string)($data['summary']['omzet_pending'] ?? 0)]);
+    csv_row($out, ['Total Base Qty', (string)round((float)($data['summary']['total_base_qty'] ?? 0), 2)]);
+    csv_row($out, ['Laba Kotor', (string)($data['laba_summary']['laba_kotor'] ?? 0)]);
+    csv_row($out, []);
 
-    fputcsv($out, ['DETAIL TRANSAKSI']);
-    fputcsv($out, ['No', 'Waktu', 'Invoice', 'Pelanggan', 'Status', 'Cara Bayar', 'Produk', 'Varian', 'Qty', 'Satuan', 'Konversi Base', 'Total Base Qty', 'Harga Jual', 'Subtotal', 'Harga Beli', 'Modal', 'Laba']);
+    csv_row($out, ['DETAIL TRANSAKSI']);
+    csv_row($out, ['No', 'Waktu', 'Invoice', 'Pelanggan', 'Label', 'Status', 'Cara Bayar', 'Produk', 'Varian', 'Qty', 'Satuan', 'Konversi Base', 'Total Base Qty', 'Harga Jual', 'Subtotal', 'Harga Beli', 'Modal', 'Laba']);
     // group by invoice for numbering
     $lastInvoiceCsv = null;
     $noCsv = 0;
@@ -337,11 +400,12 @@ function output_csv_export(array $data, string $startDate, string $endDate, stri
         } else {
             $showNo = '';
         }
-        fputcsv($out, [
+        csv_row($out, [
             $showNo,
             $row['transaction_at'] ?? '',
             $row['invoice_no'] ?? '',
             $row['customer_name'] ?? '',
+            $row['group_name'] ?? '-',
             $row['status'] ?? '',
             (($row['payment_method'] ?? '') === 'cash' ? 'Tunai' : 'Non Tunai'),
             $row['product_name'] ?? '',
@@ -357,12 +421,12 @@ function output_csv_export(array $data, string $startDate, string $endDate, stri
             $row['laba'] ?? 0,
         ]);
     }
-    fputcsv($out, []);
+    csv_row($out, []);
 
-    fputcsv($out, ['REKAP HARIAN']);
-    fputcsv($out, ['Tanggal', 'Jumlah Transaksi', 'Omzet Total', 'Omzet Paid', 'Omzet Pending']);
+    csv_row($out, ['REKAP HARIAN']);
+    csv_row($out, ['Tanggal', 'Jumlah Transaksi', 'Omzet Total', 'Omzet Paid', 'Omzet Pending']);
     foreach ($data['rekap_rows'] as $row) {
-        fputcsv($out, [
+        csv_row($out, [
             $row['tx_date'] ?? '',
             $row['trx_count'] ?? 0,
             $row['omzet_total'] ?? 0,
@@ -370,12 +434,26 @@ function output_csv_export(array $data, string $startDate, string $endDate, stri
             $row['omzet_pending'] ?? 0,
         ]);
     }
-    fputcsv($out, []);
+    csv_row($out, []);
 
-    fputcsv($out, ['LABA PER PRODUK']);
-    fputcsv($out, ['Produk', 'Varian', 'Qty Terjual', 'Total Base Qty', 'Satuan', 'Harga Jual Avg', 'Harga Beli', 'Omzet', 'Modal', 'Laba']);
+    csv_row($out, ['REKAP PER LABEL']);
+    csv_row($out, ['Label', 'Catatan', 'Jumlah Transaksi', 'Omzet Total', 'Omzet Paid', 'Omzet Pending']);
+    foreach (($data['label_rows'] ?? []) as $row) {
+        csv_row($out, [
+            $row['group_name'] ?? '',
+            $row['group_note'] ?? '',
+            $row['trx_count'] ?? 0,
+            $row['omzet_total'] ?? 0,
+            $row['omzet_paid'] ?? 0,
+            $row['omzet_pending'] ?? 0,
+        ]);
+    }
+    csv_row($out, []);
+
+    csv_row($out, ['LABA PER PRODUK']);
+    csv_row($out, ['Produk', 'Varian', 'Qty Terjual', 'Total Base Qty', 'Satuan', 'Harga Jual Avg', 'Harga Beli', 'Omzet', 'Modal', 'Laba']);
     foreach ($data['laba_rows'] as $row) {
-        fputcsv($out, [
+        csv_row($out, [
             $row['product_name'] ?? '',
             $row['variant_name'] ?? '',
             $row['qty_total'] ?? 0,
@@ -392,14 +470,14 @@ function output_csv_export(array $data, string $startDate, string $endDate, stri
     exit;
 }
 
-function output_excel_export(array $data, string $startDate, string $endDate, string $status, string $paymentFilter): void
+function output_excel_export(array $data, string $startDate, string $endDate, string $status, string $paymentFilter, string $groupLabel = 'Semua'): void
 {
     $filename = "laporan_transaksi_{$startDate}_{$endDate}.xls";
     header('Content-Type: application/vnd.ms-excel; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $filename . '"');
     echo '<html><head><meta charset="UTF-8"><style>table{border-collapse:collapse;}th,td{border:1px solid #999;padding:4px;font-size:12px;}th{background:#eee;}</style></head><body>';
     echo '<h3>Laporan Transaksi</h3>';
-    echo '<p>Periode: ' . htmlspecialchars($startDate . ' s/d ' . $endDate) . ' | Status: ' . htmlspecialchars(strtoupper($status)) . ' | Cara Bayar: ' . htmlspecialchars(payment_filter_label($paymentFilter)) . '</p>';
+    echo '<p>Periode: ' . htmlspecialchars($startDate . ' s/d ' . $endDate) . ' | Status: ' . htmlspecialchars(strtoupper($status)) . ' | Cara Bayar: ' . htmlspecialchars(payment_filter_label($paymentFilter)) . ' | Label: ' . htmlspecialchars($groupLabel) . '</p>';
     echo '<table>';
     echo '<tr><th colspan="2">Ringkasan</th></tr>';
     echo '<tr><td>Jumlah Transaksi</td><td>' . (float)($data['summary']['total_trx'] ?? 0) . '</td></tr>';
@@ -410,8 +488,8 @@ function output_excel_export(array $data, string $startDate, string $endDate, st
     echo '<tr><td>Laba Kotor</td><td>' . (float)($data['laba_summary']['laba_kotor'] ?? 0) . '</td></tr>';
     echo '</table><br>';
 
-    echo '<table><tr><th colspan="17">Detail Transaksi</th></tr>';
-    echo '<tr><th>No</th><th>Waktu</th><th>Invoice</th><th>Pelanggan</th><th>Status</th><th>Cara Bayar</th><th>Produk</th><th>Varian</th><th>Qty</th><th>Satuan</th><th>Konversi Base</th><th>Total Base Qty</th><th>Harga Jual</th><th>Subtotal</th><th>Harga Beli</th><th>Modal</th><th>Laba</th></tr>';
+    echo '<table><tr><th colspan="18">Detail Transaksi</th></tr>';
+    echo '<tr><th>No</th><th>Waktu</th><th>Invoice</th><th>Pelanggan</th><th>Label</th><th>Status</th><th>Cara Bayar</th><th>Produk</th><th>Varian</th><th>Qty</th><th>Satuan</th><th>Konversi Base</th><th>Total Base Qty</th><th>Harga Jual</th><th>Subtotal</th><th>Harga Beli</th><th>Modal</th><th>Laba</th></tr>';
     // group numbering for invoice
     $lastInvoiceExcel = null;
     $noExcel = 0;
@@ -429,6 +507,7 @@ function output_excel_export(array $data, string $startDate, string $endDate, st
         echo '<td>' . htmlspecialchars((string)($row['transaction_at'] ?? '')) . '</td>';
         echo '<td>' . htmlspecialchars((string)($row['invoice_no'] ?? '')) . '</td>';
         echo '<td>' . htmlspecialchars((string)($row['customer_name'] ?? '')) . '</td>';
+        echo '<td>' . htmlspecialchars((string)($row['group_name'] ?? '-')) . '</td>';
         echo '<td>' . htmlspecialchars((string)($row['status'] ?? '')) . '</td>';
         echo '<td>' . htmlspecialchars(($row['payment_method'] ?? '') === 'cash' ? 'Tunai' : 'Non Tunai') . '</td>';
         echo '<td>' . htmlspecialchars((string)($row['product_name'] ?? '')) . '</td>';
@@ -451,6 +530,20 @@ function output_excel_export(array $data, string $startDate, string $endDate, st
     foreach ($data['rekap_rows'] as $row) {
         echo '<tr>';
         echo '<td>' . htmlspecialchars((string)($row['tx_date'] ?? '')) . '</td>';
+        echo '<td>' . (float)($row['trx_count'] ?? 0) . '</td>';
+        echo '<td>' . (float)($row['omzet_total'] ?? 0) . '</td>';
+        echo '<td>' . (float)($row['omzet_paid'] ?? 0) . '</td>';
+        echo '<td>' . (float)($row['omzet_pending'] ?? 0) . '</td>';
+        echo '</tr>';
+    }
+    echo '</table><br>';
+
+    echo '<table><tr><th colspan="6">Rekap Per Label</th></tr>';
+    echo '<tr><th>Label</th><th>Catatan</th><th>Jumlah Transaksi</th><th>Omzet Total</th><th>Omzet Paid</th><th>Omzet Pending</th></tr>';
+    foreach (($data['label_rows'] ?? []) as $row) {
+        echo '<tr>';
+        echo '<td>' . htmlspecialchars((string)($row['group_name'] ?? '')) . '</td>';
+        echo '<td>' . htmlspecialchars((string)($row['group_note'] ?? '')) . '</td>';
         echo '<td>' . (float)($row['trx_count'] ?? 0) . '</td>';
         echo '<td>' . (float)($row['omzet_total'] ?? 0) . '</td>';
         echo '<td>' . (float)($row['omzet_paid'] ?? 0) . '</td>';
@@ -490,6 +583,23 @@ if (!in_array($status, ['all', 'pending', 'paid'], true)) {
 if (!in_array($paymentFilter, ['all', 'cash', 'non_cash'], true)) {
     $paymentFilter = 'all';
 }
+$groupFilter = trim((string)($_GET['group_id'] ?? ''));
+if ($groupFilter !== 'none' && $groupFilter !== '' && !ctype_digit($groupFilter)) {
+    $groupFilter = '';
+}
+$labelOptions = $pdo->query('SELECT id, group_name FROM transaction_groups ORDER BY group_name ASC')->fetchAll(PDO::FETCH_ASSOC);
+// Teks filter label untuk header laporan / export.
+$groupFilterLabel = 'Semua Label';
+if ($groupFilter === 'none') {
+    $groupFilterLabel = 'Tanpa Label';
+} elseif ($groupFilter !== '') {
+    foreach ($labelOptions as $opt) {
+        if ((string)$opt['id'] === $groupFilter) {
+            $groupFilterLabel = (string)$opt['group_name'];
+            break;
+        }
+    }
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)($_POST['action'] ?? '') === 'refresh_unit_snapshot') {
     $startDatePost = trim((string)($_POST['start_date'] ?? date('Y-m-01')));
@@ -502,25 +612,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)($_POST['action'] ?? '') ==
     if (!in_array($paymentFilterPost, ['all', 'cash', 'non_cash'], true)) {
         $paymentFilterPost = 'all';
     }
+    $groupFilterPost = trim((string)($_POST['group_id'] ?? ''));
+    if ($groupFilterPost !== 'none' && $groupFilterPost !== '' && !ctype_digit($groupFilterPost)) {
+        $groupFilterPost = '';
+    }
     $updated = sync_missing_unit_snapshots($pdo, $startDatePost, $endDatePost, $statusPost, $paymentFilterPost);
-    header('Location: laporan.php?start_date=' . urlencode($startDatePost) . '&end_date=' . urlencode($endDatePost) . '&status=' . urlencode($statusPost) . '&payment_method=' . urlencode($paymentFilterPost) . '&msg=unit_refresh_done&updated=' . $updated);
+    header('Location: laporan.php?start_date=' . urlencode($startDatePost) . '&end_date=' . urlencode($endDatePost) . '&status=' . urlencode($statusPost) . '&payment_method=' . urlencode($paymentFilterPost) . '&group_id=' . urlencode($groupFilterPost) . '&msg=unit_refresh_done&updated=' . $updated);
     exit;
 }
 
-$data = fetch_report_data($pdo, $startDate, $endDate, $status, $paymentFilter);
+$data = fetch_report_data($pdo, $startDate, $endDate, $status, $paymentFilter, $groupFilter);
 
 $exportType = trim((string)($_GET['export'] ?? ''));
 if ($exportType === 'csv') {
-    output_csv_export($data, $startDate, $endDate, $status, $paymentFilter);
+    output_csv_export($data, $startDate, $endDate, $status, $paymentFilter, $groupFilterLabel);
 }
 if ($exportType === 'excel') {
-    output_excel_export($data, $startDate, $endDate, $status, $paymentFilter);
+    output_excel_export($data, $startDate, $endDate, $status, $paymentFilter, $groupFilterLabel);
 }
 
 $summary = $data['summary'];
 $labaSummary = $data['laba_summary'];
 $detailRows = $data['detail_rows'];
 $rekapRows = $data['rekap_rows'];
+$labelRows = $data['label_rows'] ?? [];
 $labaRows = $data['laba_rows'];
 $baseQtyByUnit = [];
 foreach ($detailRows as $dr) {
@@ -784,10 +899,22 @@ foreach ($detailRows as $dr) {
                       <option value="non_cash" <?= $paymentFilter === 'non_cash' ? 'selected' : '' ?>>Non Tunai</option>
                   </select>
               </div>
+              <div>
+                  <label for="group_id">Label Transaksi</label>
+                  <select id="group_id" name="group_id">
+                      <option value="" <?= $groupFilter === '' ? 'selected' : '' ?>>Semua Label</option>
+                      <option value="none" <?= $groupFilter === 'none' ? 'selected' : '' ?>>Tanpa Label</option>
+                      <?php foreach ($labelOptions as $opt): ?>
+                          <option value="<?= (int)$opt['id'] ?>" <?= $groupFilter === (string)$opt['id'] ? 'selected' : '' ?>>
+                              <?= htmlspecialchars((string)$opt['group_name'], ENT_QUOTES, 'UTF-8') ?>
+                          </option>
+                      <?php endforeach; ?>
+                  </select>
+              </div>
             <button class="btn-primary" type="submit" style="height:40px;">Terapkan</button>
             <button class="btn-secondary" type="button" style="height:40px;" onclick="openPrintChooser()">Cetak</button>
-            <a class="btn-secondary" style="height:40px;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;" href="?start_date=<?= urlencode($startDate) ?>&end_date=<?= urlencode($endDate) ?>&status=<?= urlencode($status) ?>&payment_method=<?= urlencode($paymentFilter) ?>&export=excel">Save as Excel</a>
-            <a class="btn-secondary" style="height:40px;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;" href="?start_date=<?= urlencode($startDate) ?>&end_date=<?= urlencode($endDate) ?>&status=<?= urlencode($status) ?>&payment_method=<?= urlencode($paymentFilter) ?>&export=csv">Save as CSV</a>
+            <a class="btn-secondary" style="height:40px;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;" href="?start_date=<?= urlencode($startDate) ?>&end_date=<?= urlencode($endDate) ?>&status=<?= urlencode($status) ?>&payment_method=<?= urlencode($paymentFilter) ?>&group_id=<?= urlencode($groupFilter) ?>&export=excel">Save as Excel</a>
+            <a class="btn-secondary" style="height:40px;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;" href="?start_date=<?= urlencode($startDate) ?>&end_date=<?= urlencode($endDate) ?>&status=<?= urlencode($status) ?>&payment_method=<?= urlencode($paymentFilter) ?>&group_id=<?= urlencode($groupFilter) ?>&export=csv">Save as CSV</a>
         </form>
 
         <div class="cards">
@@ -829,13 +956,14 @@ foreach ($detailRows as $dr) {
             </summary>
             <div class="panel-body">
             <div class="table-wrap">
-                <table class="table" style="min-width:1360px;">
+                <table class="table" style="min-width:1460px;">
                     <thead>
                     <tr>
                         <th class="sortable-th" data-sort-type="num">No <span class="sort-icon">↕</span></th>
                         <th class="sortable-th" data-sort-type="date">Waktu <span class="sort-icon">↕</span></th>
                         <th class="sortable-th" data-sort-type="text">Invoice <span class="sort-icon">↕</span></th>
                         <th class="sortable-th" data-sort-type="text">Pelanggan <span class="sort-icon">↕</span></th>
+                        <th class="sortable-th" data-sort-type="text">Label <span class="sort-icon">↕</span></th>
                         <th class="sortable-th" data-sort-type="text">Status <span class="sort-icon">↕</span></th>
                         <th class="sortable-th" data-sort-type="text">Cara Bayar <span class="sort-icon">↕</span></th>
                         <th class="sortable-th" data-sort-type="text">Produk <span class="sort-icon">↕</span></th>
@@ -849,6 +977,7 @@ foreach ($detailRows as $dr) {
                                 <input type="hidden" name="end_date" value="<?= htmlspecialchars($endDate) ?>">
                                 <input type="hidden" name="status" value="<?= htmlspecialchars($status) ?>">
                                 <input type="hidden" name="payment_method" value="<?= htmlspecialchars($paymentFilter) ?>">
+                                <input type="hidden" name="group_id" value="<?= htmlspecialchars($groupFilter) ?>">
                                 <button type="submit" class="btn-refresh-icon" title="Refresh satuan dari master produk">
                                     <i data-feather="refresh-cw" style="width:13px;height:13px;"></i>
                                 </button>
@@ -866,7 +995,7 @@ foreach ($detailRows as $dr) {
                     </thead>
                     <tbody id="detailBody">
                     <?php if (empty($detailRows)): ?>
-                        <tr><td colspan="17" style="text-align:center;color:var(--text-muted);padding:16px;">Tidak ada data transaksi.</td></tr>
+                        <tr><td colspan="18" style="text-align:center;color:var(--text-muted);padding:16px;">Tidak ada data transaksi.</td></tr>
                     <?php else: ?>
                         <?php
                         // invoice grouping for numbering
@@ -889,6 +1018,7 @@ foreach ($detailRows as $dr) {
                                 <td><?= htmlspecialchars((string)$row['transaction_at']) ?></td>
                                 <td><?= htmlspecialchars((string)$row['invoice_no']) ?></td>
                                 <td><?= htmlspecialchars((string)$row['customer_name']) ?></td>
+                                <td><?= htmlspecialchars((string)($row['group_name'] ?? '-')) ?></td>
                                 <td><span class="badge <?= $row['status'] === 'paid' ? 'paid' : 'pending' ?>">
                                     <?= $row['status'] === 'paid' ? 'Paid' : 'Pending' ?></span></td>
                                 <td><?= (($row['payment_method'] ?? '') === 'cash') ? 'Tunai' : 'Non Tunai' ?></td>
@@ -910,7 +1040,7 @@ foreach ($detailRows as $dr) {
                     <?php if (!empty($detailRows)): ?>
                     <tfoot>
                         <tr class="tfoot-total">
-                            <td colspan="8">Total</td>
+                            <td colspan="9">Total</td>
                             <td class="num"><?= number_format($detailQtyTotal, 0, ',', '.') ?></td>
                             <td class="num">-</td>
                             <td class="num">-</td>
@@ -960,6 +1090,68 @@ foreach ($detailRows as $dr) {
                         <?php endforeach; ?>
                     <?php endif; ?>
                     </tbody>
+                </table>
+            </div>
+            </div>
+        </details>
+
+    <details id="panel-label" class="panel">
+            <summary class="panel-head">
+                <span>Laporan Transaksi Rekap (Per Label)</span>
+                <span class="panel-toggle">Klik untuk collapse/expand</span>
+            </summary>
+            <div class="panel-body">
+            <div class="table-wrap">
+                <table class="table" style="min-width:760px;">
+                    <thead>
+                    <tr>
+                        <th>Label</th>
+                        <th>Catatan</th>
+                        <th class="num">Jumlah Transaksi</th>
+                        <th class="num">Omzet Total</th>
+                        <th class="num">Omzet Paid</th>
+                        <th class="num">Omzet Pending</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <?php if (empty($labelRows)): ?>
+                        <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:16px;">Tidak ada data label. Buat label di menu Transaksi lalu masukkan transaksinya.</td></tr>
+                    <?php else: ?>
+                        <?php
+                        $labelTrxTotal = 0;
+                        $labelOmzetTotal = 0.0;
+                        $labelPaidTotal = 0.0;
+                        $labelPendingTotal = 0.0;
+                        ?>
+                        <?php foreach ($labelRows as $row): ?>
+                            <?php
+                            $labelTrxTotal += (int)$row['trx_count'];
+                            $labelOmzetTotal += (float)$row['omzet_total'];
+                            $labelPaidTotal += (float)$row['omzet_paid'];
+                            $labelPendingTotal += (float)$row['omzet_pending'];
+                            ?>
+                            <tr>
+                                <td><?= htmlspecialchars((string)$row['group_name']) ?></td>
+                                <td><?= htmlspecialchars((string)($row['group_note'] ?? '')) ?></td>
+                                <td class="num"><?= number_format((float)$row['trx_count'], 0, ',', '.') ?></td>
+                                <td class="num"><?= rupiah($row['omzet_total']) ?></td>
+                                <td class="num"><?= rupiah($row['omzet_paid']) ?></td>
+                                <td class="num"><?= rupiah($row['omzet_pending']) ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                    </tbody>
+                    <?php if (!empty($labelRows)): ?>
+                    <tfoot>
+                        <tr class="tfoot-total">
+                            <td colspan="2">Total</td>
+                            <td class="num"><?= number_format($labelTrxTotal, 0, ',', '.') ?></td>
+                            <td class="num"><?= rupiah($labelOmzetTotal) ?></td>
+                            <td class="num"><?= rupiah($labelPaidTotal) ?></td>
+                            <td class="num"><?= rupiah($labelPendingTotal) ?></td>
+                        </tr>
+                    </tfoot>
+                    <?php endif; ?>
                 </table>
             </div>
             </div>
@@ -1034,6 +1226,7 @@ foreach ($detailRows as $dr) {
         <div style="margin-bottom:12px;">
             <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="print_detail" checked> <span>Laporan Transaksi Detail</span></label>
             <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="print_rekap" checked> <span>Laporan Transaksi Rekap (Harian)</span></label>
+            <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="print_label" checked> <span>Laporan Transaksi Rekap (Per Label)</span></label>
             <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="print_laba" checked> <span>Laporan Transaksi Laba</span></label>
         </div>
         <div style="display:flex;gap:8px;justify-content:flex-end;">
@@ -1071,9 +1264,10 @@ function closePrintChooser() {
 function doPrintSelected() {
     const detail = document.getElementById('print_detail').checked;
     const rekap = document.getElementById('print_rekap').checked;
+    const label = document.getElementById('print_label').checked;
     const laba = document.getElementById('print_laba').checked;
 
-    if (!detail && !rekap && !laba) {
+    if (!detail && !rekap && !label && !laba) {
         alert('Pilih setidaknya satu laporan untuk dicetak.');
         return;
     }
@@ -1081,11 +1275,13 @@ function doPrintSelected() {
     // targets
     const pd = document.getElementById('panel-detail');
     const pr = document.getElementById('panel-rekap');
+    const pg = document.getElementById('panel-label');
     const pl = document.getElementById('panel-laba');
 
     // hide those not selected by adding class print-hidden
     if (pd) { if (!detail) pd.classList.add('print-hidden'); else pd.classList.remove('print-hidden'); }
     if (pr) { if (!rekap) pr.classList.add('print-hidden'); else pr.classList.remove('print-hidden'); }
+    if (pg) { if (!label) pg.classList.add('print-hidden'); else pg.classList.remove('print-hidden'); }
     if (pl) { if (!laba) pl.classList.add('print-hidden'); else pl.classList.remove('print-hidden'); }
 
     // hide chooser modal itself
@@ -1095,6 +1291,7 @@ function doPrintSelected() {
     function restore() {
         if (pd) pd.classList.remove('print-hidden');
         if (pr) pr.classList.remove('print-hidden');
+        if (pg) pg.classList.remove('print-hidden');
         if (pl) pl.classList.remove('print-hidden');
         window.removeEventListener('afterprint', restore);
     }

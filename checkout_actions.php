@@ -123,6 +123,29 @@ function ensure_transaction_tables(PDO $pdo): void
     if (!$hasBaseQtyTotal) {
         $pdo->exec("ALTER TABLE sales_transaction_items ADD COLUMN base_qty_total DECIMAL(15,4) NOT NULL DEFAULT 0 AFTER unit_base_qty_snapshot");
     }
+    // Penanda opsional: transaksi ini berasal dari pembelian (PO) supplier yang mana.
+    $hasPurchaseId = $pdo->query("SHOW COLUMNS FROM sales_transactions LIKE 'purchase_id'")->fetch(PDO::FETCH_ASSOC);
+    if (!$hasPurchaseId) {
+        $pdo->exec("ALTER TABLE sales_transactions ADD COLUMN purchase_id INT UNSIGNED NULL AFTER invoice_no");
+        $pdo->exec("ALTER TABLE sales_transactions ADD KEY idx_sales_purchase_id (purchase_id)");
+    }
+
+    // Kelompok transaksi buatan kasir sendiri (dinamai manual dari menu Transaksi).
+    $pdo->exec(
+        'CREATE TABLE IF NOT EXISTS transaction_groups (
+            id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            group_name VARCHAR(120) NOT NULL UNIQUE,
+            group_note VARCHAR(255) NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+    );
+    // Satu transaksi hanya bisa masuk ke satu kelompok, sama polanya dengan purchase_id.
+    $hasGroupId = $pdo->query("SHOW COLUMNS FROM sales_transactions LIKE 'group_id'")->fetch(PDO::FETCH_ASSOC);
+    if (!$hasGroupId) {
+        $pdo->exec("ALTER TABLE sales_transactions ADD COLUMN group_id INT UNSIGNED NULL AFTER purchase_id");
+        $pdo->exec("ALTER TABLE sales_transactions ADD KEY idx_sales_group_id (group_id)");
+    }
 }
 
 function json_error(int $statusCode, string $message): void
@@ -380,6 +403,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
                 $startDate = $legacyDate;
                 $endDate = $legacyDate;
             }
+            $purchaseFilter = trim((string)($_GET['purchase_id'] ?? ''));
+            $groupFilter = trim((string)($_GET['group_id'] ?? ''));
+            $groupBy = trim((string)($_GET['group_by'] ?? ''));
+            if (!in_array($groupBy, ['purchase', 'supplier', 'group', 'date'], true)) {
+                $groupBy = '';
+            }
             $page = max(1, (int)($_GET['page'] ?? 1));
             $pageSize = (int)($_GET['page_size'] ?? 20);
             if ($pageSize < 5) $pageSize = 5;
@@ -404,49 +433,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             }
 
             if ($startDate !== '' && $endDate !== '') {
-                $where[] = 'DATE(transaction_at) BETWEEN :start_date AND :end_date';
+                $where[] = 'DATE(st.transaction_at) BETWEEN :start_date AND :end_date';
                 $params[':start_date'] = $startDate;
                 $params[':end_date'] = $endDate;
             } elseif ($startDate !== '') {
-                $where[] = 'DATE(transaction_at) >= :start_date';
+                $where[] = 'DATE(st.transaction_at) >= :start_date';
                 $params[':start_date'] = $startDate;
             } elseif ($endDate !== '') {
-                $where[] = 'DATE(transaction_at) <= :end_date';
+                $where[] = 'DATE(st.transaction_at) <= :end_date';
                 $params[':end_date'] = $endDate;
             }
 
             if (in_array($status, ['pending', 'paid'], true)) {
-                $where[] = 'status = :status';
+                $where[] = 'st.status = :status';
                 $params[':status'] = $status;
             }
             if ($search !== '') {
-                $where[] = "(LOWER(invoice_no) LIKE CONCAT('%', LOWER(:search_invoice), '%') OR LOWER(COALESCE(customer_name, '')) LIKE CONCAT('%', LOWER(:search_customer), '%'))";
+                $where[] = "(LOWER(st.invoice_no) LIKE CONCAT('%', LOWER(:search_invoice), '%') OR LOWER(COALESCE(st.customer_name, '')) LIKE CONCAT('%', LOWER(:search_customer), '%'))";
                 $params[':search_invoice'] = $searchLower;
                 $params[':search_customer'] = $searchLower;
             }
+            // 'none' = transaksi yang belum ditandai berasal dari pembelian mana pun.
+            if ($purchaseFilter === 'none') {
+                $where[] = 'st.purchase_id IS NULL';
+            } elseif ($purchaseFilter !== '' && ctype_digit($purchaseFilter)) {
+                $where[] = 'st.purchase_id = :purchase_id';
+                $params[':purchase_id'] = (int)$purchaseFilter;
+            }
+            // 'none' = transaksi yang belum dimasukkan ke kelompok mana pun.
+            if ($groupFilter === 'none') {
+                $where[] = 'st.group_id IS NULL';
+            } elseif ($groupFilter !== '' && ctype_digit($groupFilter)) {
+                $where[] = 'st.group_id = :group_id';
+                $params[':group_id'] = (int)$groupFilter;
+            }
             $whereSql = empty($where) ? '1=1' : implode(' AND ', $where);
 
-            $countStmt = $pdo->prepare("SELECT COUNT(*) FROM sales_transactions WHERE {$whereSql}");
+            // Modul pembelian bisa saja belum pernah dibuka di instalasi baru, jadi join-nya dijaga.
+            $hasPurchaseTables = (bool)$pdo->query("SHOW TABLES LIKE 'purchase_orders'")->fetch(PDO::FETCH_NUM)
+                && (bool)$pdo->query("SHOW TABLES LIKE 'master_suppliers'")->fetch(PDO::FETCH_NUM);
+            $fromSql = $hasPurchaseTables
+                ? "FROM sales_transactions st
+                        LEFT JOIN purchase_orders po ON po.id = st.purchase_id
+                        LEFT JOIN master_suppliers sup ON sup.id = po.supplier_id"
+                : 'FROM sales_transactions st';
+            // Tabel kelompok selalu ada (dibuat oleh ensure_transaction_tables).
+            $fromSql .= ' LEFT JOIN transaction_groups tg ON tg.id = st.group_id';
+
+            $countStmt = $pdo->prepare("SELECT COUNT(*) {$fromSql} WHERE {$whereSql}");
             $countStmt->execute($params);
             $totalRows = (int)$countStmt->fetchColumn();
+
+            $selectSql = "SELECT st.id, st.invoice_no, st.status, st.is_printed, st.printed_at, st.transaction_at, st.customer_name,
+                                 st.subtotal, st.discount, st.downpayment, st.total, st.paid_amount, st.change_amount,
+                                 st.payment_method, st.payment_note, st.is_non_cash, st.purchase_id,
+                                 st.group_id, tg.group_name, tg.group_note";
+            $selectSql .= $hasPurchaseTables
+                ? ", po.invoice_no AS purchase_invoice_no, po.invoice_date AS purchase_invoice_date,
+                     po.supplier_id AS supplier_id, sup.supplier_name AS supplier_name"
+                : ", NULL AS purchase_invoice_no, NULL AS purchase_invoice_date, NULL AS supplier_id, NULL AS supplier_name";
+
+            if ($groupBy !== '') {
+                // Mode kelompok: paginasi dimatikan supaya subtotal per grup tidak terpotong halaman.
+                if ($groupBy === 'group') {
+                    $orderSql = 'ORDER BY (tg.group_name IS NULL), tg.group_name ASC, st.id DESC';
+                } elseif ($groupBy === 'date') {
+                    $orderSql = 'ORDER BY DATE(st.transaction_at) DESC, st.id DESC';
+                } elseif (!$hasPurchaseTables) {
+                    $orderSql = 'ORDER BY st.id DESC';
+                } elseif ($groupBy === 'supplier') {
+                    $orderSql = 'ORDER BY (sup.supplier_name IS NULL), sup.supplier_name ASC, st.id DESC';
+                } else {
+                    $orderSql = 'ORDER BY (po.invoice_no IS NULL), po.invoice_date DESC, po.invoice_no DESC, st.id DESC';
+                }
+                $rowsStmt = $pdo->prepare("{$selectSql} {$fromSql} WHERE {$whereSql} {$orderSql}");
+                $rowsStmt->execute($params);
+                $rows = $rowsStmt->fetchAll(PDO::FETCH_ASSOC);
+                echo json_encode([
+                    'success' => true,
+                    'transactions' => $rows,
+                    'group_by' => $groupBy,
+                    'pagination' => [
+                        'page' => 1,
+                        'page_size' => $totalRows,
+                        'total_rows' => $totalRows,
+                        'total_pages' => 1,
+                    ],
+                ]);
+                exit;
+            }
+
             $totalPages = max(1, (int)ceil($totalRows / $pageSize));
             if ($page > $totalPages) {
                 $page = $totalPages;
             }
             $offset = ($page - 1) * $pageSize;
 
-        $listSql = "SELECT id, invoice_no, status, is_printed, printed_at, transaction_at, customer_name, subtotal, discount, downpayment, total, paid_amount, change_amount, payment_method, payment_note, is_non_cash
-                    FROM sales_transactions
-                    WHERE {$whereSql}
-                    ORDER BY id DESC
-                    LIMIT {$pageSize} OFFSET {$offset}";
-            $rowsStmt = $pdo->prepare($listSql);
+            $rowsStmt = $pdo->prepare("{$selectSql} {$fromSql} WHERE {$whereSql} ORDER BY st.id DESC LIMIT {$pageSize} OFFSET {$offset}");
             $rowsStmt->execute($params);
             $rows = $rowsStmt->fetchAll(PDO::FETCH_ASSOC);
 
             echo json_encode([
                 'success' => true,
                 'transactions' => $rows,
+                'group_by' => '',
                 'pagination' => [
                     'page' => $page,
                     'page_size' => $pageSize,
@@ -458,6 +548,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         } catch (Throwable $e) {
             error_log('[TX_LIST_ERROR] ' . $e->getMessage());
             json_error(500, 'Gagal memuat daftar transaksi.');
+        }
+    }
+    // Daftar label + ringkasan isinya, dipakai filter/dock/modal di menu Transaksi.
+    if ($action === 'list_groups') {
+        try {
+            $groups = $pdo->query(
+                'SELECT tg.id, tg.group_name, tg.group_note,
+                        COUNT(st.id) AS tx_count,
+                        COALESCE(SUM(st.subtotal - st.discount), 0) AS tx_total
+                 FROM transaction_groups tg
+                 LEFT JOIN sales_transactions st ON st.group_id = tg.id
+                 GROUP BY tg.id, tg.group_name, tg.group_note
+                 ORDER BY tg.group_name ASC'
+            )->fetchAll(PDO::FETCH_ASSOC);
+            $ungrouped = (int)$pdo->query('SELECT COUNT(*) FROM sales_transactions WHERE group_id IS NULL')->fetchColumn();
+            echo json_encode([
+                'success' => true,
+                'groups' => $groups,
+                'ungrouped_count' => $ungrouped,
+            ]);
+            exit;
+        } catch (Throwable $e) {
+            error_log('[TX_GROUP_LIST_ERROR] ' . $e->getMessage());
+            json_error(500, 'Gagal memuat daftar label.');
         }
     }
     if ($action === 'detail') {
@@ -472,6 +586,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
         $itemsStmt = $pdo->prepare('SELECT * FROM sales_transaction_items WHERE transaction_id = :id ORDER BY id ASC');
         $itemsStmt->execute([':id' => $id]);
         $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $tx['purchase_invoice_no'] = null;
+        $tx['purchase_invoice_date'] = null;
+        $tx['supplier_name'] = null;
+        if (!empty($tx['purchase_id']) && $pdo->query("SHOW TABLES LIKE 'purchase_orders'")->fetch(PDO::FETCH_NUM)) {
+            $poStmt = $pdo->prepare(
+                'SELECT po.invoice_no, po.invoice_date, sup.supplier_name
+                 FROM purchase_orders po
+                 LEFT JOIN master_suppliers sup ON sup.id = po.supplier_id
+                 WHERE po.id = :pid'
+            );
+            $poStmt->execute([':pid' => (int)$tx['purchase_id']]);
+            $po = $poStmt->fetch(PDO::FETCH_ASSOC);
+            if ($po) {
+                $tx['purchase_invoice_no'] = $po['invoice_no'];
+                $tx['purchase_invoice_date'] = $po['invoice_date'];
+                $tx['supplier_name'] = $po['supplier_name'];
+            }
+        }
         echo json_encode(['success' => true, 'transaction' => $tx, 'items' => $items]);
         exit;
     }
@@ -664,6 +797,197 @@ try {
         $stmt->execute([':id' => $id]);
         $pdo->commit();
         echo json_encode(['success' => true]);
+        exit;
+    }
+
+    // Tag opsional: menandai transaksi ini berasal dari pembelian (PO) supplier tertentu.
+    if ($action === 'set_purchase') {
+        $id = (int)($payload['transaction_id'] ?? 0);
+        if ($id <= 0) json_error(422, 'ID transaksi tidak valid.');
+
+        $rawPurchaseId = $payload['purchase_id'] ?? '';
+        $purchaseId = ($rawPurchaseId === '' || $rawPurchaseId === null) ? 0 : (int)$rawPurchaseId;
+
+        $check = $pdo->prepare('SELECT id FROM sales_transactions WHERE id = :id');
+        $check->execute([':id' => $id]);
+        if (!$check->fetch(PDO::FETCH_ASSOC)) json_error(404, 'Transaksi tidak ditemukan.');
+
+        if ($purchaseId > 0) {
+            $poCheck = $pdo->prepare('SELECT id FROM purchase_orders WHERE id = :pid');
+            $poCheck->execute([':pid' => $purchaseId]);
+            if (!$poCheck->fetch(PDO::FETCH_ASSOC)) json_error(404, 'Data pembelian tidak ditemukan.');
+        }
+
+        $stmt = $pdo->prepare('UPDATE sales_transactions SET purchase_id = :pid WHERE id = :id');
+        $stmt->execute([
+            ':pid' => $purchaseId > 0 ? $purchaseId : null,
+            ':id' => $id,
+        ]);
+        $pdo->commit();
+        echo json_encode([
+            'success' => true,
+            'message' => $purchaseId > 0 ? 'Sumber pembelian tersimpan.' : 'Tag pembelian dihapus.',
+        ]);
+        exit;
+    }
+
+    // Buat label baru atau ganti nama/catatan label yang sudah ada.
+    if ($action === 'save_group') {
+        $groupId = (int)($payload['group_id'] ?? 0);
+        $name = trim((string)($payload['group_name'] ?? ''));
+        $note = trim((string)($payload['group_note'] ?? ''));
+        if ($name === '') json_error(422, 'Nama label wajib diisi.');
+        $nameLength = function_exists('mb_strlen') ? mb_strlen($name, 'UTF-8') : strlen($name);
+        if ($nameLength > 120) json_error(422, 'Nama label maksimal 120 karakter.');
+
+        $dupe = $pdo->prepare('SELECT id FROM transaction_groups WHERE LOWER(group_name) = LOWER(:name) AND id <> :id');
+        $dupe->execute([':name' => $name, ':id' => $groupId]);
+        if ($dupe->fetch(PDO::FETCH_ASSOC)) json_error(422, 'Nama label sudah dipakai.');
+
+        if ($groupId > 0) {
+            $check = $pdo->prepare('SELECT id FROM transaction_groups WHERE id = :id');
+            $check->execute([':id' => $groupId]);
+            if (!$check->fetch(PDO::FETCH_ASSOC)) json_error(404, 'Label tidak ditemukan.');
+            $stmt = $pdo->prepare('UPDATE transaction_groups SET group_name = :name, group_note = :note WHERE id = :id');
+            $stmt->execute([
+                ':name' => $name,
+                ':note' => $note !== '' ? $note : null,
+                ':id' => $groupId,
+            ]);
+        } else {
+            $stmt = $pdo->prepare('INSERT INTO transaction_groups (group_name, group_note) VALUES (:name, :note)');
+            $stmt->execute([
+                ':name' => $name,
+                ':note' => $note !== '' ? $note : null,
+            ]);
+            $groupId = (int)$pdo->lastInsertId();
+        }
+        $pdo->commit();
+        echo json_encode([
+            'success' => true,
+            'group_id' => $groupId,
+            'group_name' => $name,
+            'message' => 'Label "' . $name . '" tersimpan.',
+        ]);
+        exit;
+    }
+
+    // Hapus label; transaksi di dalamnya hanya dilepas, tidak ikut terhapus.
+    if ($action === 'delete_group') {
+        $groupId = (int)($payload['group_id'] ?? 0);
+        if ($groupId <= 0) json_error(422, 'ID label tidak valid.');
+
+        $check = $pdo->prepare('SELECT group_name FROM transaction_groups WHERE id = :id');
+        $check->execute([':id' => $groupId]);
+        $group = $check->fetch(PDO::FETCH_ASSOC);
+        if (!$group) json_error(404, 'Label tidak ditemukan.');
+
+        $detach = $pdo->prepare('UPDATE sales_transactions SET group_id = NULL WHERE group_id = :id');
+        $detach->execute([':id' => $groupId]);
+        $released = $detach->rowCount();
+
+        $del = $pdo->prepare('DELETE FROM transaction_groups WHERE id = :id');
+        $del->execute([':id' => $groupId]);
+        $pdo->commit();
+        echo json_encode([
+            'success' => true,
+            'released' => $released,
+            'message' => 'Label "' . $group['group_name'] . '" dihapus. ' . $released . ' transaksi dilepas tanpa label.',
+        ]);
+        exit;
+    }
+
+    // Masukkan / keluarkan satu atau banyak transaksi dari sebuah label.
+    if ($action === 'assign_group') {
+        $rawIds = $payload['transaction_ids'] ?? [];
+        if (!is_array($rawIds)) $rawIds = [];
+        if (isset($payload['transaction_id'])) $rawIds[] = $payload['transaction_id'];
+        $ids = [];
+        foreach ($rawIds as $rawId) {
+            $txId = (int)$rawId;
+            if ($txId > 0 && !in_array($txId, $ids, true)) $ids[] = $txId;
+        }
+        if (empty($ids)) json_error(422, 'Pilih minimal satu transaksi.');
+        if (count($ids) > 500) json_error(422, 'Maksimal 500 transaksi per sekali proses.');
+
+        $rawGroupId = $payload['group_id'] ?? '';
+        $groupId = ($rawGroupId === '' || $rawGroupId === null) ? 0 : (int)$rawGroupId;
+        $groupName = '';
+        if ($groupId > 0) {
+            $check = $pdo->prepare('SELECT group_name FROM transaction_groups WHERE id = :id');
+            $check->execute([':id' => $groupId]);
+            $group = $check->fetch(PDO::FETCH_ASSOC);
+            if (!$group) json_error(404, 'Label tidak ditemukan.');
+            $groupName = (string)$group['group_name'];
+        }
+
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $exists = $pdo->prepare("SELECT COUNT(*) FROM sales_transactions WHERE id IN ({$placeholders})");
+        $exists->execute($ids);
+        if ((int)$exists->fetchColumn() !== count($ids)) {
+            json_error(404, 'Sebagian transaksi yang dipilih tidak ditemukan.');
+        }
+
+        $stmt = $pdo->prepare("UPDATE sales_transactions SET group_id = ? WHERE id IN ({$placeholders})");
+        $stmt->execute(array_merge([$groupId > 0 ? $groupId : null], $ids));
+        $pdo->commit();
+        echo json_encode([
+            'success' => true,
+            'affected' => count($ids),
+            'group_id' => $groupId > 0 ? $groupId : null,
+            'message' => $groupId > 0
+                ? count($ids) . ' transaksi masuk ke label "' . $groupName . '".'
+                : count($ids) . ' transaksi dikeluarkan dari label.',
+        ]);
+        exit;
+    }
+
+    // Tandai asal pembelian untuk banyak transaksi sekaligus.
+    // Versi massal dari 'set_purchase' yang hanya melayani satu transaksi.
+    if ($action === 'assign_purchase') {
+        $rawIds = $payload['transaction_ids'] ?? [];
+        if (!is_array($rawIds)) $rawIds = [];
+        if (isset($payload['transaction_id'])) $rawIds[] = $payload['transaction_id'];
+        $ids = [];
+        foreach ($rawIds as $rawId) {
+            $txId = (int)$rawId;
+            if ($txId > 0 && !in_array($txId, $ids, true)) $ids[] = $txId;
+        }
+        if (empty($ids)) json_error(422, 'Pilih minimal satu transaksi.');
+        if (count($ids) > 500) json_error(422, 'Maksimal 500 transaksi per sekali proses.');
+
+        $rawPurchaseId = $payload['purchase_id'] ?? '';
+        $purchaseId = ($rawPurchaseId === '' || $rawPurchaseId === null) ? 0 : (int)$rawPurchaseId;
+        $purchaseLabel = '';
+        if ($purchaseId > 0) {
+            if (!$pdo->query("SHOW TABLES LIKE 'purchase_orders'")->fetch(PDO::FETCH_NUM)) {
+                json_error(422, 'Modul pembelian belum tersedia.');
+            }
+            $poCheck = $pdo->prepare('SELECT invoice_no FROM purchase_orders WHERE id = :pid');
+            $poCheck->execute([':pid' => $purchaseId]);
+            $po = $poCheck->fetch(PDO::FETCH_ASSOC);
+            if (!$po) json_error(404, 'Data pembelian tidak ditemukan.');
+            $purchaseLabel = (string)$po['invoice_no'];
+        }
+
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $exists = $pdo->prepare("SELECT COUNT(*) FROM sales_transactions WHERE id IN ({$placeholders})");
+        $exists->execute($ids);
+        if ((int)$exists->fetchColumn() !== count($ids)) {
+            json_error(404, 'Sebagian transaksi yang dipilih tidak ditemukan.');
+        }
+
+        $stmt = $pdo->prepare("UPDATE sales_transactions SET purchase_id = ? WHERE id IN ({$placeholders})");
+        $stmt->execute(array_merge([$purchaseId > 0 ? $purchaseId : null], $ids));
+        $pdo->commit();
+        echo json_encode([
+            'success' => true,
+            'affected' => count($ids),
+            'purchase_id' => $purchaseId > 0 ? $purchaseId : null,
+            'message' => $purchaseId > 0
+                ? count($ids) . ' transaksi ditandai berasal dari pembelian ' . $purchaseLabel . '.'
+                : count($ids) . ' transaksi dilepas dari tag pembelian.',
+        ]);
         exit;
     }
 
