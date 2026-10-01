@@ -943,9 +943,7 @@ foreach ($templateRows as $templateRow) {
                     <p class="text-muted" style="font-size:12px;">Pilih produk atau cari kode</p>
                 </div>
                 <div class="header-tools">
-                    <select id="cashierVariantSelect" class="variant-filter" title="Varian harga aktif kasir">
-                        <option value="">Harga Normal (Utama)</option>
-                    </select>
+                    <select id="cashierVariantSelect" class="variant-filter" title="Varian harga aktif kasir"></select>
                     <div class="search-bar">
                         <i data-feather="search" class="search-icon"></i>
                         <input type="text" id="searchInput" placeholder="Cari Produk / Kode (F2)" autocomplete="off">

@@ -269,7 +269,8 @@ function getVariantOption(product, variantId) {
     id: vid,
     name: master.name,
     color: master.color,
-    price: 0,
+    // Varian belum disetting di produk ini: pakai harga jual utama, bukan Rp 0.
+    price: Number(product.price || 0),
     fallback: true,
   };
 }
@@ -306,14 +307,33 @@ function renderCategoryButtons() {
 }
 
 function renderCashierVariantOptions() {
-  cashierVariantSelect.innerHTML =
-    '<option value="">Harga Normal (Utama)</option>';
+  cashierVariantSelect.innerHTML = "";
   activeVariants.forEach((v) => {
     const opt = document.createElement("option");
     opt.value = String(v.id);
     opt.textContent = v.name;
     cashierVariantSelect.appendChild(opt);
   });
+
+  if (activeVariants.length === 0) {
+    activeCashierVariantId = "";
+    return;
+  }
+
+  const stillValid = activeVariants.some(
+    (v) => String(v.id) === String(activeCashierVariantId),
+  );
+  if (!stillValid) {
+    // Tanpa opsi bawaan, default jatuh ke varian "Normal" dari master bila ada.
+    const normal = activeVariants.find((v) =>
+      String(v.name || "")
+        .trim()
+        .toLowerCase()
+        .startsWith("normal"),
+    );
+    activeCashierVariantId = String((normal || activeVariants[0]).id);
+  }
+  cashierVariantSelect.value = activeCashierVariantId;
 }
 
 function filterProducts() {
@@ -394,7 +414,7 @@ function renderCart() {
     const product = productById(item.id);
     const hasVariantOptions = !!product && activeVariants.length > 0;
     const variantWarning = item.variant_unset
-      ? '<div class="variant-warning">Varian ini belum disetting di master produk. Harga otomatis Rp 0.</div>'
+      ? '<div class="variant-warning">Varian ini belum disetting di master produk. Memakai harga jual utama.</div>'
       : "";
     const cartItem = document.createElement("div");
     cartItem.className = "cart-item";
@@ -452,12 +472,12 @@ function updateSummary() {
     changeEl.style.color = "var(--text-muted)";
   }
 
-  checkoutBtn.disabled = cart.length === 0 || hasUnsetVariant;
+  checkoutBtn.disabled = cart.length === 0;
   saveDraftBtn.disabled = cart.length === 0;
   if (hasUnsetVariant) {
     variantValidationNotice.style.display = "block";
     variantValidationNotice.textContent =
-      "Masih ada item dengan varian harga yang belum disetting. Set harga di master produk atau pilih varian lain.";
+      "Ada item yang belum punya harga untuk varian ini, jadi memakai harga jual utama. Set harga di master produk bila perlu.";
   } else {
     variantValidationNotice.style.display = "none";
     variantValidationNotice.textContent = "";
@@ -1060,6 +1080,12 @@ function startNewTransaction() {
   if (paymentAmountModal) paymentAmountModal.value = "";
   if (paymentNoteInput) paymentNoteInput.value = "";
   if (customerNameInput) customerNameInput.value = "";
+  // Diskon & uang muka wajib ikut direset, kalau tidak nilainya terbawa ke transaksi berikutnya.
+  if (discountInput) discountInput.value = 0;
+  if (discountType) discountType.value = "nominal";
+  if (downpaymentInput) downpaymentInput.value = 0;
+  discount = 0;
+  downpayment = 0;
   setInlineValidation(checkoutValidationNotice, "");
   setInlineValidation(paymentModalValidation, "");
   renderCart();
@@ -1198,13 +1224,8 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.key === "F9") {
     e.preventDefault();
-    if (cart.length === 0) {
-      startNewTransaction();
-      return;
-    }
-    if (confirm("Mulai transaksi baru? Keranjang saat ini akan dikosongkan.")) {
-      startNewTransaction();
-    }
+    // Tanpa dialog native supaya kasir bisa langsung lanjut ke transaksi berikutnya.
+    startNewTransaction();
     return;
   }
   if (e.key === "Enter") {
